@@ -1,0 +1,12 @@
+[project]
+name = "amazinggnn"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0.0",
+    "torch-geometric>=2.4.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+]
