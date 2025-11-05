@@ -9,23 +9,102 @@ from typing import Tuple, List
 from tqdm import tqdm
 
 
-class GraphDataGenerator:
-    """图数据生成器"""
+class BaseGraphGenerator:
+    """基础图生成器 - 生成固定的基础图结构"""
     
-    def __init__(self, num_nodes_range: Tuple[int, int] = (10, 50), 
-                 num_classes: int = 5, 
-                 num_shape_classes: int = 3,
-                 seed: int = None):
+    def __init__(self, num_classes: int = 1, num_shape_classes: int = 3, seed: int = 42):
         """
         Args:
-            num_nodes_range: 节点数量范围
             num_classes: 类别数量
             num_shape_classes: 形状类别数量
             seed: 随机种子
         """
-        self.num_nodes_range = num_nodes_range
         self.num_classes = num_classes
         self.num_shape_classes = num_shape_classes
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+        
+        # 生成5个固定的基础图
+        self.base_graphs = self._generate_base_graphs()
+        print(self.base_graphs)
+        print(f"已生成 {len(self.base_graphs)} 个基础图")
+    
+    def _generate_base_graphs(self) -> List[Data]:
+        """生成5个固定的基础图"""
+        base_graphs = []
+        
+        # 为5个基础图定义不同的节点数量
+        node_counts = [20, 25, 30, 35, 40]
+        
+        for graph_id, num_nodes in enumerate(node_counts):
+            # 使用固定的种子确保每个基础图一致
+            np.random.seed(42 + graph_id)
+            random.seed(42 + graph_id)
+            
+            # 生成节点特征
+            coords = np.random.randn(num_nodes, 4).astype(np.float32)
+            classes = np.random.randint(0, self.num_classes, (num_nodes, 1)).astype(np.float32)
+            shape_classes = np.random.randint(0, self.num_shape_classes, (num_nodes, 1)).astype(np.float32)
+            
+            node_features = np.concatenate([coords, classes, shape_classes], axis=1)
+            node_features = torch.tensor(node_features, dtype=torch.float32)
+            
+            # 生成固定的边结构
+            edge_list = []
+            edge_features_list = []
+            
+            # 创建最小生成树
+            nodes = list(range(num_nodes))
+            np.random.shuffle(nodes)
+            for i in range(1, num_nodes):
+                parent = nodes[np.random.randint(0, i)]
+                child = nodes[i]
+                edge_list.append([parent, child])
+                edge_feat = np.random.randn(2).astype(np.float32)
+                edge_features_list.append(edge_feat)
+            
+            # 添加额外的边
+            num_extra_edges = num_nodes + graph_id * 5  # 每个图有不同数量的边
+            for _ in range(num_extra_edges):
+                src = np.random.randint(0, num_nodes)
+                dst = np.random.randint(0, num_nodes)
+                if src != dst and [src, dst] not in edge_list:
+                    edge_list.append([src, dst])
+                    edge_feat = np.random.randn(2).astype(np.float32)
+                    edge_features_list.append(edge_feat)
+            
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            edge_attr = torch.tensor(edge_features_list, dtype=torch.float32)
+            
+            graph = Data(x=node_features, edge_index=edge_index, edge_attr=edge_attr)
+            base_graphs.append(graph)
+        
+        return base_graphs
+    
+    def get_base_graph(self, index: int) -> Data:
+        """获取指定的基础图"""
+        return self.base_graphs[index % len(self.base_graphs)]
+
+
+class GraphDataGenerator:
+    """图数据生成器 - 基于基础图添加噪声生成变体"""
+    
+    def __init__(self, base_generator: BaseGraphGenerator,
+                 coord_noise_std: float = 0.1,
+                 edge_noise_std: float = 0.1,
+                 seed: int = None):
+        """
+        Args:
+            base_generator: 基础图生成器
+            coord_noise_std: 坐标高斯噪声标准差
+            edge_noise_std: 边特征高斯噪声标准差
+            seed: 随机种子
+        """
+        self.base_generator = base_generator
+        self.coord_noise_std = coord_noise_std
+        self.edge_noise_std = edge_noise_std
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -33,55 +112,28 @@ class GraphDataGenerator:
     
     def generate_graph(self) -> Data:
         """
-        生成完整的图数据
+        从基础图生成变体（添加高斯噪声）
         节点特征：[坐标x1, 坐标x2, 坐标x3, 坐标x4, 类别, 形状类别]
         边特征：[向量x, 向量y]
         """
-        # 随机生成节点数量
-        num_nodes = random.randint(*self.num_nodes_range)
+        # 随机选择一个基础图
+        base_idx = random.randint(0, len(self.base_generator.base_graphs) - 1)
+        base_graph = self.base_generator.get_base_graph(base_idx)
         
-        # 生成节点特征
-        # 坐标4个参数
-        coords = np.random.randn(num_nodes, 4).astype(np.float32)
-        # 类别1个参数 (0到num_classes-1)
-        classes = np.random.randint(0, self.num_classes, (num_nodes, 1)).astype(np.float32)
-        # 形状类别1个参数 (0到num_shape_classes-1)
-        shape_classes = np.random.randint(0, self.num_shape_classes, (num_nodes, 1)).astype(np.float32)
+        # 复制基础图
+        x = base_graph.x.clone()
+        edge_index = base_graph.edge_index.clone()
+        edge_attr = base_graph.edge_attr.clone()
         
-        # 拼接节点特征 [坐标4个 + 类别1个 + 形状类别1个 = 6个]
-        node_features = np.concatenate([coords, classes, shape_classes], axis=1)
-        node_features = torch.tensor(node_features, dtype=torch.float32)
+        # 对节点坐标（前4列）添加高斯噪声
+        coord_noise = np.random.normal(0, self.coord_noise_std, size=(x.size(0), 4)).astype(np.float32)
+        x[:, :4] = x[:, :4] + torch.tensor(coord_noise, dtype=torch.float32)
         
-        # 生成边（使用随机图结构，可以是有向图）
-        # 随机生成边，确保图连通
-        edge_list = []
-        edge_features_list = []
+        # 对边特征添加高斯噪声
+        edge_noise = np.random.normal(0, self.edge_noise_std, size=edge_attr.shape).astype(np.float32)
+        edge_attr = edge_attr + torch.tensor(edge_noise, dtype=torch.float32)
         
-        # 首先创建一个最小生成树确保连通性
-        nodes = list(range(num_nodes))
-        random.shuffle(nodes)
-        for i in range(1, num_nodes):
-            parent = random.choice(nodes[:i])
-            child = nodes[i]
-            edge_list.append([parent, child])
-            # 生成二维向量作为边特征
-            edge_feat = np.random.randn(2).astype(np.float32)
-            edge_features_list.append(edge_feat)
-        
-        # 添加一些额外的随机边
-        num_extra_edges = random.randint(num_nodes, num_nodes * 2)
-        for _ in range(num_extra_edges):
-            src = random.randint(0, num_nodes - 1)
-            dst = random.randint(0, num_nodes - 1)
-            if src != dst and [src, dst] not in edge_list:
-                edge_list.append([src, dst])
-                edge_feat = np.random.randn(2).astype(np.float32)
-                edge_features_list.append(edge_feat)
-        
-        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-        edge_attr = torch.tensor(edge_features_list, dtype=torch.float32)
-        
-        return Data(x=node_features, edge_index=edge_index, edge_attr=edge_attr)
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
 class GraphOccluder:
@@ -277,8 +329,20 @@ def train_model(model: GraphCompletenessPredictor,
                 num_epochs: int = 100,
                 batch_size: int = 32,
                 learning_rate: float = 0.001,
-                num_samples: int = 1000):
-    """训练模型"""
+                num_samples: int = 1000,
+                complete_sample_ratio: float = 0.1):
+    """训练模型
+    
+    Args:
+        model: 模型
+        generator: 数据生成器
+        occluder: 遮挡器
+        num_epochs: 训练轮数
+        batch_size: 批次大小
+        learning_rate: 学习率
+        num_samples: 每个epoch的样本数
+        complete_sample_ratio: 完整图（完整度为1）样本的比例
+    """
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -287,6 +351,7 @@ def train_model(model: GraphCompletenessPredictor,
     
     print(f"使用设备: {device}")
     print(f"开始训练，共 {num_epochs} 个epoch...")
+    print(f"完整图样本比例: {complete_sample_ratio*100:.1f}%")
     
     # 计算batch数量
     num_batches_per_epoch = (num_samples + batch_size - 1) // batch_size
@@ -309,13 +374,23 @@ def train_model(model: GraphCompletenessPredictor,
             batch_targets = []
             
             # 生成一个batch的数据
-            for _ in range(min(batch_size, num_samples - batch_idx)):
+            batch_size_actual = min(batch_size, num_samples - batch_idx)
+            num_complete_in_batch = int(batch_size_actual * complete_sample_ratio)
+            
+            for i in range(batch_size_actual):
                 # 生成完整图
                 full_graph = generator.generate_graph()
-                # 应用遮挡
-                occluded_graph, completeness = occluder.occlude_graph(full_graph)
-                batch_graphs.append(occluded_graph)
-                batch_targets.append(completeness)
+                
+                # 根据比例决定是否使用完整图（完整度为1）
+                if i < num_complete_in_batch:
+                    # 使用完整图，不应用遮挡，完整度为1.0
+                    batch_graphs.append(full_graph)
+                    batch_targets.append(1.0)
+                else:
+                    # 应用遮挡
+                    occluded_graph, completeness = occluder.occlude_graph(full_graph)
+                    batch_graphs.append(occluded_graph)
+                    batch_targets.append(completeness)
             
             # 将图移动到设备
             batch_graphs = [g.to(device) for g in batch_graphs]
@@ -354,8 +429,17 @@ def train_model(model: GraphCompletenessPredictor,
 def evaluate_model(model: GraphCompletenessPredictor,
                    generator: GraphDataGenerator,
                    occluder: GraphOccluder,
-                   num_samples: int = 100):
-    """评估模型"""
+                   num_samples: int = 100,
+                   num_complete_samples: int = 20):
+    """评估模型
+    
+    Args:
+        model: 模型
+        generator: 数据生成器
+        occluder: 遮挡器
+        num_samples: 遮挡样本数量
+        num_complete_samples: 完整度1的样本数量
+    """
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -386,16 +470,16 @@ def evaluate_model(model: GraphCompletenessPredictor,
     
     avg_error = total_error / num_samples
     mse = np.mean([e**2 for e in errors])
-    print(f"\n评估结果 (样本数: {num_samples}):")
+    print(f"\n评估结果 (遮挡样本数: {num_samples}):")
     print(f"平均绝对误差: {avg_error:.6f}")
     print(f"均方误差: {mse:.6f}")
     print(f"最大误差: {max(errors):.6f}")
     print(f"最小误差: {min(errors):.6f}")
     
-    # 测试完整图（应该接近1）
-    print("\n测试完整图（无遮挡）:")
+    # 测试完整图（完整度为1）
+    print(f"\n评估完整图（完整度为1，样本数: {num_complete_samples}）:")
     complete_errors = []
-    complete_pbar = tqdm(range(20), desc="测试完整图", unit="样本")
+    complete_pbar = tqdm(range(num_complete_samples), desc="评估完整图", unit="样本")
     for _ in complete_pbar:
         full_graph = generator.generate_graph().to(device)
         # 不应用遮挡，完整度应该是1.0
@@ -404,7 +488,12 @@ def evaluate_model(model: GraphCompletenessPredictor,
         complete_errors.append(error)
         complete_pbar.set_postfix({'预测完整度': f'{pred:.4f}', '误差': f'{error:.4f}'})
     
-    print(f"完整图平均误差: {np.mean(complete_errors):.6f}")
+    complete_avg_error = np.mean(complete_errors)
+    complete_mse = np.mean([e**2 for e in complete_errors])
+    print(f"完整图平均绝对误差: {complete_avg_error:.6f}")
+    print(f"完整图均方误差: {complete_mse:.6f}")
+    print(f"完整图最大误差: {max(complete_errors):.6f}")
+    print(f"完整图最小误差: {min(complete_errors):.6f}")
 
 
 def main():
@@ -412,11 +501,19 @@ def main():
     print("图缺失预测任务")
     print("=" * 60)
     
-    # 创建数据生成器和遮挡器
-    generator = GraphDataGenerator(
-        num_nodes_range=(15, 40),
+    # 创建基础图生成器（生成5个固定的基础图）
+    print("\n生成基础图...")
+    base_generator = BaseGraphGenerator(
         num_classes=5,
         num_shape_classes=3,
+        seed=42
+    )
+    
+    # 创建数据生成器（基于基础图添加噪声）
+    generator = GraphDataGenerator(
+        base_generator=base_generator,
+        coord_noise_std=0.1,  # 坐标高斯噪声标准差
+        edge_noise_std=0.1,   # 边特征高斯噪声标准差
         seed=42
     )
     
@@ -444,7 +541,8 @@ def main():
         num_epochs=50,
         batch_size=16,
         learning_rate=0.001,
-        num_samples=500
+        num_samples=500,
+        complete_sample_ratio=0.2  # 增加完整图样本比例到20%
     )
     
     # 评估模型
